@@ -42,3 +42,5 @@ This is a simple device that uses an ESP32, an e-ink screen and a sensor to moni
 I used the Arduino IDE because the Espressif Matter SDK is a pain to compile and work with, and I am not a big fan of C++ either. Maybe in the future I will port the code to the SDK so I can use Thread instead of Wi-Fi, but who knows.
 
 I formatted and commented the code a lot. For some of the sensors, the Arduino Matter library still doesn't have classes, so in those cases I imported them from the Matter libraries and had to instantiate everything manually.
+
+> this is a WIP I will add more documentation, images and details later.
