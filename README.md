@@ -136,3 +136,9 @@ Everything is in `sensorMonitor_v1.ino`:
 ## Roadmap
 
 - Port to the ESP-IDF Matter SDK to use Thread instead of Wi-Fi.
+
+## License
+
+Copyright (C) 2026 Ismael Carrea
+
+This project, including the code, the 3D case and the images, is licensed under the [GNU General Public License v3.0](LICENSE). You can use, modify and share it, including commercially, as long as any version you distribute is also released under GPL-3.0 with its source.
