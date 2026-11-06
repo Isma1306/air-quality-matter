@@ -14,7 +14,6 @@ The story of how it was built, and everything that went wrong along the way, is 
 - Calculates an overall air quality grade (A+ to F) from the worst individual reading.
 - Shows everything on a 4.2" e-ink screen that only redraws when a value changes noticeably.
 - Exposes the readings and the grade over Matter (Wi-Fi). Tested with HomeKit and Home Assistant.
-- Gets the Wi-Fi credentials from your phone over Bluetooth during pairing, so nothing is hardcoded.
 
 ## Parts
 
