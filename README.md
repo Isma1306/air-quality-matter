@@ -13,7 +13,11 @@ The story of how it was built, and everything that went wrong along the way, is 
 - Measures CO2, TVOC, formaldehyde (HCHO), PM2.5, PM10, temperature and humidity with a single M702 sensor.
 - Calculates an overall air quality grade (A+ to F) from the worst individual reading.
 - Shows everything on a 4.2" e-ink screen that only redraws when a value changes noticeably.
-- Exposes the readings and the grade over Matter (Wi-Fi). Tested with HomeKit and Home Assistant.
+- Each reading with a grade has a small bar of shaded squares under its value: five squares means A+, one square means F.
+- Exposes the readings and the grade over Matter. Tested with HomeKit and Home Assistant.
+- Two firmware versions for the same hardware:
+  - **Arduino** (`sensorMonitor_v1.ino`): Matter over **Wi-Fi**, the easiest to build.
+  - **ESP-IDF** (`idf/`): Matter over **Thread**, with its own pairing code per device and the pairing QR code drawn on the e-ink screen.
 
 ## Parts
 
@@ -53,6 +57,10 @@ The pins avoid the ESP32-C6 strapping pins (4, 5, 8, 9, 15), native USB (12, 13)
 
 ## Build and flash
 
+Pick one of the two versions. Both use the same wiring and the same screen layout.
+
+### Arduino version (Wi-Fi)
+
 This uses the Arduino IDE (or `arduino-cli`) instead of ESP-IDF. Some Matter clusters have no Arduino wrapper yet, so the sketch creates them directly with the `esp_matter` API that ships with the ESP32 Arduino core.
 
 1. Install the **esp32** board package by Espressif. It was built with version **3.3.11**. The Matter API changes between releases, so other versions may need small fixes.
@@ -72,16 +80,53 @@ This uses the Arduino IDE (or `arduino-cli`) instead of ESP-IDF. Some Matter clu
 
 4. Upload.
 
+### ESP-IDF version (Thread)
+
+This is a native port to ESP-IDF and the esp-matter SDK. It uses the ESP32-C6's 802.15.4 radio to join a Thread network instead of Wi-Fi, so you need a Thread border router (for example an Apple TV 4K, a HomePod mini or a Home Assistant SkyConnect). Bluetooth is only used during pairing.
+
+It was built with **ESP-IDF v5.5.6** and **esp-matter 1.5.x**, which is the same esp-matter version as the Arduino core 3.3.11. esp-matter and the QR code library are downloaded automatically from the ESP component registry (`idf/main/idf_component.yml`), so you only need ESP-IDF installed.
+
+1. Install [ESP-IDF v5.5.x](https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32c6/get-started/index.html) and activate its environment. Install `esp-matter-mfg-tool` in the IDF Python environment (`pip install esp-matter-mfg-tool`).
+2. Generate the pairing data for your device, once per device:
+
+   ```sh
+   cd idf
+   ./factory/gen_factory.sh
+   ```
+
+   This creates a random passcode and discriminator and a new device certificate (DAC) in `idf/factory/out/fctry.bin`. The certificate is signed by the public Matter test PAI (VID 0xFFF1 / PID 0x8000), so the device is uncertified but pairs normally. The vendor and product names shown in the Home apps are set in this script.
+
+   > [!IMPORTANT]
+   > `idf/factory/out/` holds the device's private key and passcode and is git-ignored. Keep a backup. If you lose it, generate new data and pair the device again.
+
+3. Build and flash. `idf.py flash` writes the factory partition too:
+
+   ```sh
+   idf.py set-target esp32c6      # first time only
+   idf.py build
+   idf.py -p /dev/ttyACM0 erase-flash flash monitor
+   ```
+
+The partition table (`idf/partitions.csv`) matches the Arduino "Huge APP" layout and adds a `fctry` partition for the pairing data. More details are in [`idf/README.md`](idf/README.md).
+
 ## Pairing
+
+**Arduino version**
 
 1. Open the serial monitor at **115200** baud and reset the board.
 2. The first time, it prints a **manual pairing code** and a **QR code URL**. Open the URL to get a QR code you can scan.
 3. Add it from your Home app (HomeKit, Home Assistant, Google Home…). The phone sends the Wi-Fi credentials over Bluetooth during pairing.
-4. HomeKit will warn that the accessory is not certified. Accept it to continue.
+
+**ESP-IDF version**
+
+1. While it's not paired, the e-ink screen shows the **QR code** and the **manual pairing code**. A printable copy is in `idf/factory/out/qrcode.png`.
+2. Scan it from your Home app. The phone gives it the Thread network credentials over Bluetooth.
+
+With either version, HomeKit will warn that the accessory is not certified. Accept it to continue.
 
 Once paired, it reconnects to the stored network on every boot.
 
-To reset it, **hold the BOOT button for 5 seconds**. It decommissions itself and can be paired again.
+To reset it, **hold the BOOT button for 5 seconds**. It decommissions itself and can be paired again. On the ESP-IDF version, removing the device from the last Home app it's paired with also resets it, and the pairing code stays the same after a reset because it lives in its own partition.
 
 > [!NOTE]
 > CO2, TVOC and HCHO need about 5 minutes to warm up. Until then the screen shows `--` and those values are not sent over Matter.
@@ -116,7 +161,7 @@ Over Matter the grade is mapped to the Air Quality cluster: A+ → Good, A → F
 
 ## Customising
 
-Everything is in `sensorMonitor_v1.ino`:
+In the Arduino version everything is in `sensorMonitor_v1.ino`. In the ESP-IDF version the same settings are in `idf/main/app_main.cpp` (pins, intervals, warm-up) and `idf/main/ui.cpp` (screen layout, redraw rules, grade thresholds), and the names shown in the Home apps are set in `idf/factory/gen_factory.sh`.
 
 | What                         | Where                                                                 |
 | ---------------------------- | --------------------------------------------------------------------- |
@@ -132,10 +177,6 @@ Everything is in `sensorMonitor_v1.ino`:
 ## Case
 
 `airquality_v5.3mf` contains the case, ready to slice. It was printed in matte PLA with the slicer's default settings, nothing special. The parts are held together with M2 and M3 brass heat-set inserts, so you can use normal screws.
-
-## Roadmap
-
-- Port to the ESP-IDF Matter SDK to use Thread instead of Wi-Fi.
 
 ## License
 
