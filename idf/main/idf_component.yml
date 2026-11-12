@@ -2,3 +2,5 @@ dependencies:
   idf: ">=5.4"
   # Same esp-matter version that the Arduino core 3.3.11 is built with
   espressif/esp_matter: "~1.5.0"
+  # QR code generator for the pairing screen
+  espressif/qrcode: "^0.1.0"

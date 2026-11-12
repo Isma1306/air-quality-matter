@@ -6,7 +6,12 @@
 //
 // Matter endpoints (same order as the Arduino build):
 //   1 = Temperature Sensor, 2 = Humidity Sensor, 3 = Air Quality Sensor
+//
+// Network: Matter over Thread (BLE only for commissioning).
+// Pairing data (passcode, discriminator, DAC, vendor/product names, serial)
+// is per device and lives in the "fctry" partition: see factory/gen_factory.sh.
 
+#include <atomic>
 #include <math.h>
 #include <string.h>
 
@@ -16,7 +21,6 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -28,7 +32,10 @@
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/clusters/air-quality-server/air-quality-server.h>
 #include <app/server/Server.h>
-#include <platform/DeviceInstanceInfoProvider.h>
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+#include <esp_openthread_types.h>
+#include <platform/ESP32/OpenthreadLauncher.h>
+#endif
 #include <setup_payload/OnboardingCodesUtil.h>
 
 #include "epd.h"
@@ -72,10 +79,6 @@ static const uint32_t INTERVAL_MS = 3000;
 // Gas sensor (CO2/TVOC/HCHO) warm-up: values are ignored and shown as "--"
 static const uint32_t GAS_WARMUP_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 
-// Device identity shown in HomeKit (Manufacturer / Model). Max 32 chars.
-static const char* DEVICE_VENDOR_NAME  = "Ismael Carrea";
-static const char* DEVICE_PRODUCT_NAME = "Air Quality Sensor V1";
-
 static uint16_t temperatureEndpointId = 0;
 static uint16_t humidityEndpointId = 0;
 static uint16_t airQualityEndpointId = 0;
@@ -87,39 +90,10 @@ static inline uint32_t millis() { return (uint32_t)(esp_timer_get_time() / 1000)
 
 bool gasReady() { return millis() >= GAS_WARMUP_MS; }
 
-// ===================================================================
-// DEVICE INFO PROVIDER
-// Wraps the default provider and overrides only the vendor/product names.
-// ===================================================================
-
-class CustomDeviceInfoProvider : public chip::DeviceLayer::DeviceInstanceInfoProvider {
-public:
-    explicit CustomDeviceInfoProvider(chip::DeviceLayer::DeviceInstanceInfoProvider* base) : mBase(base) {}
-
-    CHIP_ERROR GetVendorName(char* buf, size_t bufSize) override { return copyStr(DEVICE_VENDOR_NAME, buf, bufSize); }
-    CHIP_ERROR GetProductName(char* buf, size_t bufSize) override { return copyStr(DEVICE_PRODUCT_NAME, buf, bufSize); }
-
-    CHIP_ERROR GetVendorId(uint16_t& v) override { return mBase->GetVendorId(v); }
-    CHIP_ERROR GetProductId(uint16_t& v) override { return mBase->GetProductId(v); }
-    CHIP_ERROR GetPartNumber(char* b, size_t n) override { return mBase->GetPartNumber(b, n); }
-    CHIP_ERROR GetProductURL(char* b, size_t n) override { return mBase->GetProductURL(b, n); }
-    CHIP_ERROR GetProductLabel(char* b, size_t n) override { return mBase->GetProductLabel(b, n); }
-    CHIP_ERROR GetSerialNumber(char* b, size_t n) override { return mBase->GetSerialNumber(b, n); }
-    CHIP_ERROR GetManufacturingDate(uint16_t& y, uint8_t& m, uint8_t& d) override { return mBase->GetManufacturingDate(y, m, d); }
-    CHIP_ERROR GetHardwareVersion(uint16_t& v) override { return mBase->GetHardwareVersion(v); }
-    CHIP_ERROR GetHardwareVersionString(char* b, size_t n) override { return mBase->GetHardwareVersionString(b, n); }
-    CHIP_ERROR GetRotatingDeviceIdUniqueId(chip::MutableByteSpan& s) override { return mBase->GetRotatingDeviceIdUniqueId(s); }
-
-private:
-    static CHIP_ERROR copyStr(const char* src, char* buf, size_t bufSize)
-    {
-        size_t len = strlen(src);
-        if (len >= bufSize) return CHIP_ERROR_BUFFER_TOO_SMALL;
-        memcpy(buf, src, len + 1);
-        return CHIP_NO_ERROR;
-    }
-    chip::DeviceLayer::DeviceInstanceInfoProvider* mBase;
-};
+// Set from the Matter task, handled in the main loop (which owns the display)
+static std::atomic<bool> s_commissioned{false};
+static std::atomic<bool> s_redrawRequested{false};
+static std::atomic<bool> s_resetRequested{false};
 
 // ===================================================================
 // MATTER CALLBACKS
@@ -130,6 +104,13 @@ static void app_event_cb(const ChipDeviceEvent* event, intptr_t arg)
     switch (event->Type) {
         case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
             ESP_LOGI(TAG, "Commissioning complete");
+            s_commissioned = true;
+            s_redrawRequested = true;  // replace the QR code with the sensor data
+            break;
+        case chip::DeviceLayer::DeviceEventType::kThreadConnectivityChange:
+            ESP_LOGI(TAG, "[Thread] %s",
+                     event->ThreadConnectivityChange.Result == chip::DeviceLayer::kConnectivity_Established
+                         ? "attached to the Thread network" : "detached from the Thread network");
             break;
         case chip::DeviceLayer::DeviceEventType::kFailSafeTimerExpired:
             ESP_LOGW(TAG, "Commissioning failed, fail safe timer expired");
@@ -137,15 +118,12 @@ static void app_event_cb(const ChipDeviceEvent* event, intptr_t arg)
         case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
             ESP_LOGI(TAG, "Fabric removed");
             if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
-                // Wi-Fi credentials are still there, so only advertise over DNS-SD
-                chip::CommissioningWindowManager& mgr = chip::Server::GetInstance().GetCommissioningWindowManager();
-                if (!mgr.IsCommissioningWindowOpen()) {
-                    CHIP_ERROR err = mgr.OpenBasicCommissioningWindow(chip::System::Clock::Seconds16(300),
-                                                                      chip::CommissioningWindowAdvertisement::kDnssdOnly);
-                    if (err != CHIP_NO_ERROR) {
-                        ESP_LOGE(TAG, "Failed to open commissioning window, err:%" CHIP_ERROR_FORMAT, err.Format());
-                    }
-                }
+                // Removed from the last controller: factory reset so the device
+                // leaves the Thread network and advertises over BLE with the QR
+                // code on screen again. Done from the main loop after a short
+                // delay, so the RemoveFabric response still goes out.
+                ESP_LOGW(TAG, "Last fabric removed, factory resetting");
+                s_resetRequested = true;
             }
             break;
         default:
@@ -165,18 +143,6 @@ static esp_err_t app_identification_cb(identification::callback_type_t type, uin
 {
     ESP_LOGI(TAG, "Identify request on endpoint %u", endpoint_id);
     return ESP_OK;
-}
-
-// Wi-Fi power save off once connected, for responsiveness
-static void ip_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data)
-{
-    if (base != IP_EVENT || id != IP_EVENT_STA_GOT_IP) return;
-    ip_event_got_ip_t* ev = (ip_event_got_ip_t*)data;
-    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
-    wifi_ap_record_t ap = {};
-    esp_wifi_sta_get_ap_info(&ap);
-    ESP_LOGI(TAG, "[WiFi] Connected to '%s' (IP " IPSTR "), power save off: %s",
-             (const char*)ap.ssid, IP2STR(&ev->ip_info.ip), err == ESP_OK ? "ok" : esp_err_to_name(err));
 }
 
 // ===================================================================
@@ -353,6 +319,26 @@ static bool m702Poll(SensorData& out)
 }
 
 // ===================================================================
+// PAIRING CODE
+// ===================================================================
+
+// chip-factory/pin-code, added to the fctry partition by factory/gen_factory.sh
+static bool readFactoryPasscode(uint32_t& passcode)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition(CONFIG_CHIP_FACTORY_NAMESPACE_PARTITION_LABEL, "chip-factory", NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        err = nvs_get_u32(h, "pin-code", &passcode);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No pin-code in the fctry partition (%s): re-run factory/gen_factory.sh", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+// ===================================================================
 // MAIN
 // ===================================================================
 
@@ -378,25 +364,65 @@ extern "C" void app_main()
     btn.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&btn);
 
-    // 3. Matter. Wi-Fi is owned by Matter:
+    // 3. Matter. The Thread network is owned by Matter:
     //    - not commissioned: advertises over BLE, the Home app sends the
-    //      Wi-Fi credentials during pairing and Matter stores them in NVS
-    //    - commissioned: Matter reconnects to the stored network on boot
+    //      Thread dataset of its border router during pairing and Matter
+    //      stores it in NVS
+    //    - commissioned: rejoins the stored Thread network on boot
     createMatterNode();
+
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+    // Native 802.15.4 radio, no external RCP/host
+    static esp_openthread_platform_config_t ot_config = {};
+    ot_config.radio_config.radio_mode = RADIO_MODE_NATIVE;
+    ot_config.host_config.host_connection_mode = HOST_CONNECTION_MODE_NONE;
+    ot_config.port_config.storage_partition_name = "nvs";
+    ot_config.port_config.netif_queue_size = 10;
+    ot_config.port_config.task_queue_size = 10;
+    set_openthread_platform_config(&ot_config);
+#endif
+
     ESP_ERROR_CHECK(esp_matter::start(app_event_cb));
-
-    {
-        static CustomDeviceInfoProvider customInfo(chip::DeviceLayer::GetDeviceInstanceInfoProvider());
-        chip::DeviceLayer::PlatformMgr().LockChipStack();
-        chip::DeviceLayer::SetDeviceInstanceInfoProvider(&customInfo);
-        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-    }
     initAirQualityInstance();
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_event_handler, NULL));
 
-    if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
+    s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+    if (!s_commissioned) {
         ESP_LOGI(TAG, "Matter node is not commissioned yet.");
-        PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+        auto flags = chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE);
+        char qr[128] = {}, manual[32] = {};
+        chip::MutableCharSpan qrSpan(qr, sizeof(qr) - 1), manualSpan(manual, sizeof(manual) - 1);
+
+        // The factory provider only exposes the verifier, so the SDK would fall
+        // back to the example passcode: use this device's own from the fctry partition.
+        uint32_t passcode = 0;
+        bool havePasscode = readFactoryPasscode(passcode);
+
+        chip::PayloadContents payload;
+        chip::DeviceLayer::PlatformMgr().LockChipStack();
+        CHIP_ERROR qrErr = GetPayloadContents(payload, flags);
+        if (qrErr == CHIP_NO_ERROR) {
+            payload.setUpPINCode = passcode;
+            PrintOnboardingCodes(payload);
+            qrErr = GetQRCode(qrSpan, payload);
+        }
+        CHIP_ERROR codeErr = (qrErr == CHIP_NO_ERROR) ? GetManualPairingCode(manualSpan, payload) : qrErr;
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+        if (havePasscode && qrErr == CHIP_NO_ERROR && codeErr == CHIP_NO_ERROR) {
+            qr[qrSpan.size()] = '\0';
+            manual[manualSpan.size()] = '\0';
+            // Show as XXXX-XXX-XXXX, like the printed label
+            char pretty[40];
+            if (strlen(manual) == 11) {
+                snprintf(pretty, sizeof(pretty), "%.4s-%.3s-%.4s", manual, manual + 4, manual + 7);
+            } else {
+                snprintf(pretty, sizeof(pretty), "%s", manual);
+            }
+            uiShowPairing(display, qr, pretty);
+        } else {
+            ESP_LOGE(TAG, "Failed to get onboarding codes (is the fctry partition flashed?)");
+            uiShowSplash(display, "No pairing data");
+        }
     }
 
     // 4. Main loop
@@ -406,6 +432,7 @@ extern "C" void app_main()
     int updateCounter = 0;
     bool buttonPressed = false;
     uint32_t buttonTimestamp = 0;
+    uint32_t resetRequestedAt = 0;
 
     while (true) {
         uint32_t now = millis();
@@ -416,11 +443,19 @@ extern "C" void app_main()
         // Timed Matter & display updates
         if (now - previousMillis >= INTERVAL_MS) {
             previousMillis = now;
+            if (s_redrawRequested.exchange(false)) {
+                // Just paired: leave the QR screen with a full refresh
+                if (newData) uiUpdateFull(display, latest);
+                else uiShowSplash(display, "Paired!");
+                updateCounter = 0;
+            }
             if (newData) {
                 updateMatter(latest);
 
                 updateCounter++;
-                if (updateCounter >= FULL_REFRESH_INTERVAL) {
+                if (!s_commissioned) {
+                    // Keep the QR code on screen until paired
+                } else if (updateCounter >= FULL_REFRESH_INTERVAL) {
                     uiUpdateFull(display, latest);
                     updateCounter = 0;
                 } else {
@@ -442,6 +477,12 @@ extern "C" void app_main()
             ESP_LOGW(TAG, "Decommissioning Air Sensor Matter Accessory...");
             esp_matter::factory_reset();  // erases NVS and reboots
             buttonTimestamp = millis();
+        }
+
+        // Deferred factory reset after the last controller removed the device
+        if (s_resetRequested) {
+            if (resetRequestedAt == 0) resetRequestedAt = millis() | 1;
+            else if (millis() - resetRequestedAt > 2000) esp_matter::factory_reset();
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));  // yield to the Matter task

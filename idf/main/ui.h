@@ -16,5 +16,7 @@ int calculateIAQI(const SensorData& d);
 const char* getIAQIText(int score);
 
 void uiShowSplash(Epd& display, const char* text);
+// Pairing screen: Matter QR code + manual pairing code (shown while uncommissioned)
+void uiShowPairing(Epd& display, const char* qrPayload, const char* manualCode);
 void uiUpdateFull(Epd& display, const SensorData& d);
 void uiUpdatePartial(Epd& display, const SensorData& d);  // only refreshes if values changed enough
