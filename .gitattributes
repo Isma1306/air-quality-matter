@@ -1,0 +1,2 @@
+# Adafruit GFX bitmap fonts (generated data, not code): keep them out of GitHub's language stats
+idf/main/fonts/** linguist-vendored
